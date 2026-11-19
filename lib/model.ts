@@ -64,7 +64,18 @@ export const MODEL: ModelConstants = {
 };
 
 /** The model's version label: the dashboard names it and the rules quote it. */
-export const MODEL_VERSION = 'radar-1';
+export const MODEL_VERSION = 'radar-2';
+
+/** A ratio winsorized into a band, so one outlier cannot set a category's anchor. */
+function winsorize(value: number, low: number, high: number): number {
+  return Math.min(high, Math.max(low, value));
+}
+
+/** Logistic launch-probability factor: a long-running protocol with no token is overdue, not mature. */
+function launchProbability(ageDays: number | null, fallback: number): number {
+  const age = ageDays ?? fallback;
+  return 1 / (1 + Math.exp(-(age - 365) / 180));
+}
 
 /** How many pre-token protocols below the watchlist floor the early radar carries, by TVL. */
 export const EARLY_ROWS = 160;
@@ -187,14 +198,13 @@ export function ageDays(asOf: string, listedAt: string | null): number | null {
 }
 
 /** The three multipliers and the implied value one protocol gets under `model`. */
-export function impliedValue(protocol: SnapshotProtocol, asOf: string, model: ModelConstants): { implied: number; growthPct: number; growthMult: number; maturityMult: number; age: number | null } {
+export function impliedValue(protocol: SnapshotProtocol, asOf: string, model: ModelConstants, peerRatio = model.base_multiple): { implied: number; growthPct: number; growthMult: number; maturityMult: number; age: number | null } {
   const age = ageDays(asOf, protocol.listed_at);
   const rawGrowth = finite(protocol.change_7d, 0);
   const growthPct = Math.min(model.growth_cap, Math.max(model.growth_floor, rawGrowth));
-  const growthMult = 1 + (growthPct / 100) * model.growth_weight;
-  const ageForModel = age ?? model.unknown_age_days;
-  const maturityMult = model.maturity_floor + (Math.min(Math.max(ageForModel, 0), model.maturity_days) / model.maturity_days) * model.maturity_range;
-  const base = protocol.tvl_usd * model.base_multiple;
+  const growthMult = 1 + model.growth_weight * Math.tanh(rawGrowth / 50);
+  const maturityMult = launchProbability(age, model.unknown_age_days);
+  const base = protocol.tvl_usd * peerRatio;
   const implied = Math.max(1, Math.round(base * growthMult * maturityMult));
   return { implied, growthPct, growthMult, maturityMult, age };
 }
@@ -207,9 +217,18 @@ export function isPreToken(p: SnapshotProtocol): boolean {
   return p.mcap_usd === null && p.gecko_id === null && p.symbol === null;
 }
 
-/** Whether a protocol is one the board may rank: pre-token, not an exchange, not a versioned pool. */
+const WRAPPED = /\b(wrapped|staked|staking)\b/i;
+const EXCHANGE_PREFIX = /^(Binance|Coinbase|Bybit|Kraken|Bitget|OKX|Bitfinex|Gemini)\b/i;
+const DERIVED_CATEGORIES = new Set(['Bridge', 'Canonical Bridge', 'Liquid Staking', 'Liquid Restaking', 'Restaked BTC', 'CEX']);
+
+/** Whether a protocol is one the board may rank: pre-token, not a versioned pool or a derivative of a trading token. */
 export function isRankable(p: SnapshotProtocol): boolean {
-  return isPreToken(p) && p.category !== 'CEX' && !VERSIONED.test(p.name);
+  return isPreToken(p)
+    && p.category !== 'CEX'
+    && !VERSIONED.test(p.name)
+    && !DERIVED_CATEGORIES.has(p.category ?? '')
+    && !WRAPPED.test(p.name)
+    && !EXCHANGE_PREFIX.test(p.name);
 }
 
 /** The snapshot's protocol by slug. */
@@ -232,14 +251,14 @@ function median(values: number[], fallback: number): number {
  * cannot dominate the board.
  */
 function categoryPeers(protocols: SnapshotProtocol[]): { overall: number; map: Map<string, number>; rows: Array<{ category: string; median: number; count: number }> } {
-  const ratios = protocols.filter((p) => !isPreToken(p) && p.tvl_usd > 0 && p.mcap_usd !== null).map((p) => (p.mcap_usd ?? 0) / p.tvl_usd);
-  const overall = median(ratios, 0.17);
+  const ratios = protocols.filter((p) => !isPreToken(p) && p.tvl_usd > 0 && p.mcap_usd !== null).map((p) => winsorize((p.mcap_usd ?? 0) / p.tvl_usd, 0.02, 2));
+  const overall = median(ratios, 0.169);
   const groups = new Map<string, number[]>();
   for (const p of protocols) {
     if (isPreToken(p) || p.tvl_usd <= 0 || p.mcap_usd === null) continue;
     const key = p.category ?? 'Other';
     const list = groups.get(key) ?? [];
-    list.push(p.mcap_usd! / p.tvl_usd);
+    list.push(winsorize(p.mcap_usd! / p.tvl_usd, 0.02, 2));
     groups.set(key, list);
   }
   const map = new Map<string, number>();
@@ -247,7 +266,8 @@ function categoryPeers(protocols: SnapshotProtocol[]): { overall: number; map: M
   for (const [category, values] of groups) {
     const raw = median(values, overall);
     rows.push({ category, median: round4(raw), count: values.length });
-    map.set(category, Math.min(1.8, Math.max(0.6, raw / (overall || 0.17))));
+    // Categories with fewer than four listed comparables do not get their own anchor.
+    map.set(category, values.length >= 4 ? round4(raw) : round4(overall));
   }
   rows.sort((a, b) => b.median - a.median || (a.category < b.category ? -1 : 1));
   return { overall, map, rows };
@@ -271,23 +291,23 @@ export function buildBoard(snapshot: Snapshot, model: ModelConstants = MODEL): B
     const p = index.get(slug);
     if (p !== undefined) chosen.set(slug, p);
   }
-  // The early radar: pre-token protocols below the watchlist floor, by TVL, capped. Never a replacement
-  // for a watchlist row: a chosen protocol stays chosen.
-  const early = snapshot.protocols
-    .filter((p) => !chosen.has(p.slug) && isRankable(p) && p.tvl_usd < snapshot.floor_usd)
-    .sort((a, b) => b.tvl_usd - a.tvl_usd || (a.slug < b.slug ? -1 : a.slug > b.slug ? 1 : 0))
-    .slice(0, EARLY_ROWS);
-  for (const p of early) chosen.set(p.slug, p);
-
+  // Every rankable pre-token protocol is scored, not just the ones above the floor. The watchlist is
+  // forced in first, then the strongest early finds by implied value, so the radar actually finds
+  // promising protocols before they reach $50M of TVL.
+  const watchlistSet = new Set(snapshot.watchlist);
+  const eligible = snapshot.protocols.filter((p) => isRankable(p));
   const peers = categoryPeers(snapshot.protocols);
-  const scored = [...chosen.values()].map((p) => {
-    const { implied: baseImplied, growthPct, growthMult, maturityMult, age } = impliedValue(p, snapshot.as_of, model);
-    const peer = peers.map.get(p.category ?? 'Other') ?? 1;
+  const scoreOne = (p: SnapshotProtocol) => {
+    const peer = peers.map.get(p.category ?? 'Other') ?? peers.overall;
+    const { implied, growthPct, growthMult, maturityMult, age } = impliedValue(p, snapshot.as_of, model, peer);
     const chainBreadth = round4(1 + Math.min(Math.max(p.chains.length - 1, 0), 4) * 0.02);
     const confidence = round4((p.change_7d === null ? 0.9 : 1) * (age === null ? 0.9 : 1));
-    const implied = Math.max(1, Math.round(baseImplied * peer * chainBreadth * confidence));
-    return { p, implied, growthPct, growthMult, maturityMult, age, peer, chainBreadth, confidence };
-  });
+    return { p, implied: Math.max(1, Math.round(implied * chainBreadth * confidence)), growthPct, growthMult, maturityMult, age, peer, chainBreadth, confidence };
+  };
+  const watchlistRows = eligible.filter((p) => watchlistSet.has(p.slug)).map(scoreOne);
+  const earlyRows = eligible.filter((p) => !watchlistSet.has(p.slug)).map(scoreOne);
+  earlyRows.sort((a, b) => b.implied - a.implied || (a.p.slug < b.p.slug ? -1 : a.p.slug > b.p.slug ? 1 : 0));
+  const scored = watchlistRows.concat(earlyRows.slice(0, 300));
   scored.sort((a, b) => b.implied - a.implied || (a.p.slug < b.p.slug ? -1 : a.p.slug > b.p.slug ? 1 : 0));
   return scored.map((s, i) => ({
     rank: i + 1,

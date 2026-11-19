@@ -29,14 +29,14 @@
   // The model in one function: the page recomputes a row from the snapshot figures and checks the
   // number board.json carries, so the page's code and the board's data are visibly the same arithmetic.
   function impliedOf(row, model) {
-    var growth = Math.min(model.growth_cap, Math.max(model.growth_floor, row.change_7d === null || row.change_7d === undefined ? 0 : row.change_7d));
-    var growthMult = 1 + (growth / 100) * model.growth_weight;
+    var growth = row.change_7d === null || row.change_7d === undefined ? 0 : row.change_7d;
+    var growthMult = 1 + model.growth_weight * Math.tanh(growth / 50);
     var age = row.age_days === null || row.age_days === undefined ? model.unknown_age_days : row.age_days;
-    var maturity = model.maturity_floor + (Math.min(Math.max(age, 0), model.maturity_days) / model.maturity_days) * model.maturity_range;
-    var peer = row.peer_multiple === undefined ? 1 : row.peer_multiple;
+    var launch = 1 / (1 + Math.exp(-(age - 365) / 180));
+    var peer = row.peer_multiple === undefined ? model.base_multiple : row.peer_multiple;
     var chain = row.chain_breadth === undefined ? 1 : row.chain_breadth;
     var confidence = row.confidence === undefined ? 1 : row.confidence;
-    return Math.max(1, Math.round(row.tvl_usd * model.base_multiple * growthMult * maturity * peer * chain * confidence));
+    return Math.max(1, Math.round(row.tvl_usd * peer * growthMult * launch * chain * confidence));
   }
 
   function el(tag, attrs) {
@@ -337,11 +337,11 @@
       el('h2', { text: 'How implied value is computed' }),
       el('p', { class: 'sub', text: 'Every row is scored by one function of the snapshot figures. No protocol name is special-cased, and no row is hand-picked.' }),
       el('div', { class: 'formula' },
-        'implied = round( tvl x ' + m.base_multiple + ' x growth x maturity x peer x chain x confidence )',
+        'implied = round( TVL x categoryRatio x (1 + 0.5 x tanh(change_7d / 50)) x logistic((age - 365) / 180) x chain x confidence )',
         el('br'),
-        'growth = 1 + clamp(change_7d, ' + m.growth_floor + ', ' + m.growth_cap + ')/100 x ' + m.growth_weight + '  |  maturity = ' + m.maturity_floor + ' + min(age,' + m.maturity_days + ')/' + m.maturity_days + ' x ' + m.maturity_range
+        'categoryRatio = winsorized median of mcap/TVL for listed protocols in the same category (fallback: snapshot median ' + DATA.benchmark.live_median_mcap_tvl.toFixed(2) + 'x). Live-token protocols are never ranked.'
       ),
-      el('p', { class: 'sub', text: 'Every input comes from the sealed snapshot or from the listed protocols in that same snapshot: category peer multiple is the median market cap/TVL of that category’s live tokens relative to the overall median, clamped to 0.6–1.8. Chain breadth adds up to 8% for protocols live on several chains; confidence discounts missing growth or listing dates. No protocol name is special-cased, and no row is hand-picked.' }),
+      el('p', { class: 'sub', text: 'TVL sets size. Tanh shrinks a noisy seven-day move so one bad week cannot dominate. The logistic term treats a long run without a token as overdue, not merely mature; an unknown listing date uses ' + m.unknown_age_days + ' days and is flagged. Chain breadth adds up to 8%; confidence discounts missing growth or dates. No protocol name is special-cased, and no row is hand-picked.' }),
     );
   }
 
